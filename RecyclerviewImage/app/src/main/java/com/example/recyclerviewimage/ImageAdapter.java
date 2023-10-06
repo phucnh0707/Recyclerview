@@ -25,11 +25,6 @@ public class ImageAdapter extends RecyclerView.Adapter<ImageAdapter.ImageViewHol
         notifyDataSetChanged();
     }
 
-//    public void setData(List<Image> list){
-//        this.mListImage = list;
-//        notifyDataSetChanged();
-//    }
-
     @NonNull
     @Override
     public ImageViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
@@ -44,7 +39,6 @@ public class ImageAdapter extends RecyclerView.Adapter<ImageAdapter.ImageViewHol
             return;
         }
         holder.imgImg.setImageResource(image.getResourceId());
-        holder.tvName.setText(image.getName());
 
     }
 
@@ -60,7 +54,6 @@ public class ImageAdapter extends RecyclerView.Adapter<ImageAdapter.ImageViewHol
     public class ImageViewHolder extends RecyclerView.ViewHolder {
         private RelativeLayout layoutItem;
         private ImageView imgImg;
-        private TextView tvName;
 
 
         public ImageViewHolder(@NonNull View itemView) {
@@ -68,7 +61,6 @@ public class ImageAdapter extends RecyclerView.Adapter<ImageAdapter.ImageViewHol
             layoutItem = itemView.findViewById(R.id.layoutItem);
 
             imgImg = itemView.findViewById(R.id.img_img);
-            tvName = itemView.findViewById(R.id.tv_name_img);
 
         }
     }
