@@ -1,0 +1,235 @@
+name: Beaverly Effort Metrics
+
+on:
+  # Ongoing events — fire on every PR and push to main
+  pull_request:
+    types: [opened, synchronize, closed]
+  push:
+    branches: [main]
+  # One-time full-history sync — trigger manually after adding the repo to Beaverly
+  workflow_dispatch:
+
+jobs:
+  # ── Ongoing event reporting ────────────────────────────────────────────────
+  report:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect and send git metrics
+        env:
+          BEAVERLY_API_URL: https://f6b248cef784.ngrok-free.app
+          BEAVERLY_KEY: ${{ secrets.BEAVERLY_KEY }}
+        run: |
+          set -euo pipefail
+
+          EVENT="${{ github.event_name }}"
+          REPO="${{ github.repository }}"
+          REPO_ID="${{ github.event.repository.id }}"
+
+          # ── Determine commit range ────────────────────────────────────────
+          if [ "$EVENT" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+            RANGE="$BASE..$HEAD"
+          else
+            BEFORE="${{ github.event.before }}"
+            AFTER="${{ github.event.after }}"
+            if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              RANGE="$AFTER~1..$AFTER"
+            else
+              RANGE="$BEFORE..$AFTER"
+            fi
+          fi
+
+          # ── Build commits JSON array ──────────────────────────────────────
+          COMMITS_JSON="[]"
+          while IFS='|' read -r SHA AN AE AI CN CE CI MSG; do
+            [ -z "$SHA" ] && continue
+            STATS=$(git show --numstat --format="" "$SHA" \
+              | awk '{f++; a+=$1; d+=$2} END {printf "%d %d %d", f+0, a+0, d+0}')
+            FILES=$(echo "$STATS" | cut -d' ' -f1)
+            ADDED=$(echo "$STATS" | cut -d' ' -f2)
+            DELETED=$(echo "$STATS" | cut -d' ' -f3)
+            PARENTS=$(git show --no-patch --format="%P" "$SHA" | wc -w)
+            IS_MERGE=$( [ "$PARENTS" -gt 1 ] && echo "true" || echo "false" )
+            COMMIT=$(jq -n \
+              --arg sha "$SHA" --arg author_name "$AN" --arg author_email "$AE" \
+              --arg author_date "$AI" --arg committer_name "$CN" \
+              --arg committer_email "$CE" --arg committed_at "$CI" --arg message "$MSG" \
+              --argjson files_changed "$FILES" --argjson lines_added "$ADDED" \
+              --argjson lines_deleted "$DELETED" --argjson is_merge_commit "$IS_MERGE" \
+              '{sha:$sha,author_name:$author_name,author_email:$author_email,
+                author_date:$author_date,committer_name:$committer_name,
+                committer_email:$committer_email,committed_at:$committed_at,
+                message:$message,files_changed:$files_changed,
+                lines_added:$lines_added,lines_deleted:$lines_deleted,
+                is_merge_commit:$is_merge_commit}')
+            COMMITS_JSON=$(echo "$COMMITS_JSON" | jq --argjson c "$COMMIT" '. + [$c]')
+          done < <(git log --format="%H|%an|%ae|%aI|%cn|%ce|%cI|%s" "$RANGE" 2>/dev/null || true)
+
+          # ── Build pull_request block (PR events only) ─────────────────────
+          PR_JSON="null"
+          if [ "$EVENT" = "pull_request" ]; then
+            PR_JSON=$(jq -n \
+              --argjson number "${{ github.event.pull_request.number }}" \
+              --arg title "${{ github.event.pull_request.title }}" \
+              --arg state "${{ github.event.pull_request.state }}" \
+              --arg url "${{ github.event.pull_request.html_url }}" \
+              --arg source_branch "${{ github.head_ref }}" \
+              --arg target_branch "${{ github.base_ref }}" \
+              --arg author_name "${{ github.event.pull_request.user.login }}" \
+              --arg created_at "${{ github.event.pull_request.created_at }}" \
+              --arg updated_at "${{ github.event.pull_request.updated_at }}" \
+              '{number:$number,title:$title,state:$state,url:$url,
+                source_branch:$source_branch,target_branch:$target_branch,
+                author_name:$author_name,created_at:$created_at,
+                updated_at:$updated_at}')
+          fi
+
+          PAYLOAD=$(jq -n \
+            --arg repository "$REPO" \
+            --argjson github_repository_id "$REPO_ID" \
+            --arg event_type "$EVENT" \
+            --argjson pull_request "$PR_JSON" \
+            --argjson commits "$COMMITS_JSON" \
+            '{repository:$repository,github_repository_id:$github_repository_id,
+              event_type:$event_type,pull_request:$pull_request,commits:$commits}')
+
+          echo "Sending to Beaverly ($EVENT, $REPO)..."
+          curl -fsSL -X POST "${BEAVERLY_API_URL}/api/v1/webhooks/github/git-log" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${BEAVERLY_KEY}" \
+            -d "$PAYLOAD"
+          echo "Done."
+
+  # ── Full historical sync (run once via workflow_dispatch) ──────────────────
+  initial-sync:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect and send full git history in chunks
+        env:
+          BEAVERLY_API_URL: https://f6b248cef784.ngrok-free.app
+          BEAVERLY_KEY: ${{ secrets.BEAVERLY_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_CHUNK_SIZE: "200"
+          PR_CHUNK_SIZE: "50"
+        run: |
+          set -euo pipefail
+
+          REPO="${{ github.repository }}"
+          REPO_ID="${{ github.event.repository.id }}"
+
+          # ── Collect ALL commits (all branches) ────────────────────────────
+          echo "Collecting full commit history..."
+          ALL_COMMITS_FILE=$(mktemp)
+          git log --format="%H|%an|%ae|%aI|%cn|%ce|%cI|%s" --all > "$ALL_COMMITS_FILE"
+          TOTAL_COMMITS=$(wc -l < "$ALL_COMMITS_FILE")
+          echo "Total commits: $TOTAL_COMMITS"
+
+          TOTAL_COMMIT_PAGES=$(( (TOTAL_COMMITS + COMMIT_CHUNK_SIZE - 1) / COMMIT_CHUNK_SIZE ))
+          [ "$TOTAL_COMMIT_PAGES" -eq 0 ] && TOTAL_COMMIT_PAGES=1
+
+          # ── Collect ALL PRs via GitHub CLI ────────────────────────────────
+          echo "Collecting pull requests..."
+          ALL_PRS_FILE=$(mktemp)
+          gh pr list \
+            --limit 10000 \
+            --state all \
+            --json number,title,state,url,headRefName,baseRefName,author,createdAt,updatedAt,mergedAt \
+            > "$ALL_PRS_FILE"
+          TOTAL_PRS=$(jq 'length' "$ALL_PRS_FILE")
+          echo "Total PRs: $TOTAL_PRS"
+
+          TOTAL_PR_PAGES=$(( (TOTAL_PRS + PR_CHUNK_SIZE - 1) / PR_CHUNK_SIZE ))
+          [ "$TOTAL_PR_PAGES" -eq 0 ] && TOTAL_PR_PAGES=1
+
+          TOTAL_PAGES=$(( TOTAL_COMMIT_PAGES > TOTAL_PR_PAGES ? TOTAL_COMMIT_PAGES : TOTAL_PR_PAGES ))
+
+          echo "Will send $TOTAL_PAGES pages ($TOTAL_COMMIT_PAGES commit pages, $TOTAL_PR_PAGES PR pages)"
+
+          # ── Send pages ────────────────────────────────────────────────────
+          for (( PAGE=1; PAGE<=TOTAL_PAGES; PAGE++ )); do
+
+            # Slice commits for this page
+            COMMIT_START=$(( (PAGE - 1) * COMMIT_CHUNK_SIZE + 1 ))
+            COMMITS_JSON=$(sed -n "${COMMIT_START},$((COMMIT_START + COMMIT_CHUNK_SIZE - 1))p" "$ALL_COMMITS_FILE" \
+              | while IFS='|' read -r SHA AN AE AI CN CE CI MSG; do
+                  [ -z "$SHA" ] && continue
+                  STATS=$(git show --numstat --format="" "$SHA" \
+                    | awk '{f++; a+=$1; d+=$2} END {printf "%d %d %d", f+0, a+0, d+0}')
+                  FILES=$(echo "$STATS" | cut -d' ' -f1)
+                  ADDED=$(echo "$STATS" | cut -d' ' -f2)
+                  DELETED=$(echo "$STATS" | cut -d' ' -f3)
+                  PARENTS=$(git show --no-patch --format="%P" "$SHA" | wc -w)
+                  IS_MERGE=$( [ "$PARENTS" -gt 1 ] && echo "true" || echo "false" )
+                  jq -n \
+                    --arg sha "$SHA" --arg author_name "$AN" --arg author_email "$AE" \
+                    --arg author_date "$AI" --arg committer_name "$CN" \
+                    --arg committer_email "$CE" --arg committed_at "$CI" --arg message "$MSG" \
+                    --argjson files_changed "$FILES" --argjson lines_added "$ADDED" \
+                    --argjson lines_deleted "$DELETED" --argjson is_merge_commit "$IS_MERGE" \
+                    '{sha:$sha,author_name:$author_name,author_email:$author_email,
+                      author_date:$author_date,committer_name:$committer_name,
+                      committer_email:$committer_email,committed_at:$committed_at,
+                      message:$message,files_changed:$files_changed,
+                      lines_added:$lines_added,lines_deleted:$lines_deleted,
+                      is_merge_commit:$is_merge_commit}'
+                done | jq -s '.')
+
+            # Slice PRs for this page
+            PR_START=$(( (PAGE - 1) * PR_CHUNK_SIZE ))
+            PRS_JSON=$(jq --argjson start "$PR_START" --argjson size "$PR_CHUNK_SIZE" \
+              '.[$start:$start+$size] | map({
+                number: .number,
+                title: .title,
+                state: (if .mergedAt != null then "merged" else .state end),
+                url: .url,
+                source_branch: .headRefName,
+                target_branch: .baseRefName,
+                author_name: .author.login,
+                created_at: .createdAt,
+                updated_at: .updatedAt,
+                merged_at: .mergedAt
+              })' "$ALL_PRS_FILE")
+
+            PAYLOAD=$(jq -n \
+              --arg repository "$REPO" \
+              --argjson github_repository_id "$REPO_ID" \
+              --argjson page "$PAGE" \
+              --argjson total_pages "$TOTAL_PAGES" \
+              --argjson commits "$COMMITS_JSON" \
+              --argjson pull_requests "$PRS_JSON" \
+              '{repository:$repository,github_repository_id:$github_repository_id,
+                page:$page,total_pages:$total_pages,
+                commits:$commits,pull_requests:$pull_requests}')
+
+            COMMIT_COUNT=$(echo "$COMMITS_JSON" | jq 'length')
+            PR_COUNT=$(echo "$PRS_JSON" | jq 'length')
+            echo "Sending page $PAGE/$TOTAL_PAGES ($COMMIT_COUNT commits, $PR_COUNT PRs)..."
+
+            curl -fsSL -X POST "${BEAVERLY_API_URL}/api/v1/webhooks/github/git-log/initial-sync" \
+              -H "Content-Type: application/json" \
+              -H "Authorization: Bearer ${BEAVERLY_KEY}" \
+              -d "$PAYLOAD"
+
+            echo "Page $PAGE done."
+          done
+
+          echo "Initial sync complete — $TOTAL_COMMITS commits, $TOTAL_PRS PRs sent."
